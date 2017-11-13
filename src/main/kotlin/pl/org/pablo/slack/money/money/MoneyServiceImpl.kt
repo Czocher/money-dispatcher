@@ -20,6 +20,7 @@ class MoneyServiceImpl(
 
     @Transactional
     override fun addMoney(addDto: AddDto) {
+        // Find who owes to whom
         val u1 = userService.getOrCreate(addDto.from)
         val u2 = userService.getOrCreate(addDto.to)
         val swap = addDto.value < 0
@@ -32,55 +33,68 @@ class MoneyServiceImpl(
         updateBalance(from, to, value)
     }
 
+    /**
+     * Update the state of the debt between the to given users by the given value.
+     *
+     * @param from the user which owes money
+     * @param to the user which is owed to
+     * @param value the amount of money which is owed
+     */
     private fun updateBalance(from: UserEntity, to: UserEntity, value: Int) {
-        var remainingValue = optimizeBetween(from, to, value)
+        var remainingValue = reduceDebt(from, to, value)
         if (remainingValue == 0) {
             return
         }
-        // Check if I own anyone money and then move this dept
+        // Check if I owe anyone money and then move this debt
         if (from.toPay.isNotEmpty()) {
-            val res: Map<Boolean, List<BalanceRelationship>> = from.toPay.stream()
-                    .sorted { x, y -> Integer.compare(x.value, y.value) }
-                    .collect(Collectors.groupingBy { to.toPay.any { o -> it.receiver.id == o.receiver.id } })
+            val res = from.toPay.sortedBy { it.value }
+                    .groupBy { to.toPay.any {o -> it.receiver.id == o.receiver.id} }
             res[true]?.forEach {
-                remainingValue = optimizeBetween(to, it.receiver, remainingValue)
+                remainingValue = reduceDebt(to, it.receiver, remainingValue)
                 if (remainingValue == 0) {
                     return
                 }
             }
             res[false]?.forEach {
-                remainingValue = optimizeTransitive(to, it, remainingValue)
+                remainingValue = transferDebt(to, it, remainingValue)
                 if (remainingValue == 0) {
                     return
                 }
             }
 
         }
-        // Create dept between me and him
+        // Create debt between me and him
         val newDebt = BalanceRelationship(to, from, remainingValue)
         from.toReturn.add(newDebt)
         to.toPay.add(newDebt)
         moneyRelationshipRepository.save(newDebt)
     }
 
-    private fun optimizeBetween(from: UserEntity, to: UserEntity, remainingValue: Int): Int {
-        //Check if I own him money
+    /**
+     * Reduce the debt between two users according to the given value.
+     *
+     * @param from the user from which the debt comes from
+     * @param to the user to which the debt goes to
+     * @param remainingValue the amount by which the debt has to be changed
+     */
+    private fun reduceDebt(from: UserEntity, to: UserEntity, remainingValue: Int): Int {
+        // Check if I owe him money
         val node = from.toPay.find { it.receiver.id == to.id }
         if (node != null) {
             return if (node.value > remainingValue) {
-                //My dept to him is reduced
+                // Reduce the debt
                 node.value -= remainingValue
                 moneyRelationshipRepository.save(node)
                 0
             } else {
-                //My dept to him is payed
+                // The debt is payed so remove the connection
                 from.toPay.remove(node)
                 to.toReturn.remove(node)
                 moneyRelationshipRepository.delete(node)
                 remainingValue - node.value
             }
         } else {
-            //Check if he already own me money
+            // Check if the other person owes me money
             val node2 = from.toReturn.find { it.payer.id == to.id }
             if (node2 != null) {
                 node2.value += remainingValue
@@ -88,11 +102,19 @@ class MoneyServiceImpl(
                 return 0
             }
         }
-        //There is no debt relationship between those two nodes
+
+        // There is no debt relationship between those two nodes
         return remainingValue
     }
 
-    private fun optimizeTransitive(from: UserEntity, old: BalanceRelationship, remainingValue: Int): Int {
+    /**
+     * Transfer debt between the given user and his other other debtors.
+     *
+     * @param from the user from which a debt is taken
+     * @param old the other debtors of this user
+     * @param remainingValue the amount of debt to transfer
+     */
+    private fun transferDebt(from: UserEntity, old: BalanceRelationship, remainingValue: Int): Int {
         return if (remainingValue >= old.value) {
             val bal = BalanceRelationship(from, old.receiver, old.value)
             moneyRelationshipRepository.save(bal)
@@ -112,5 +134,8 @@ class MoneyServiceImpl(
 
 }
 
+/**
+ * Get the current balance of the given user.
+ */
 private fun UserEntity.getBalance(): List<BalanceDto> =
         toReturn.map { BalanceDto(it.payer.name, it.value) } + toPay.map { BalanceDto(it.receiver.name, -it.value) }
